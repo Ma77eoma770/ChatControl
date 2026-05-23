@@ -185,9 +185,9 @@ def store_public_key_in_vault(
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
-            table = 'contatti_gruppo' if is_group else 'contatti'
+            table = 'sessioni_gruppo' if is_group else 'sessioni_ratchet'
             id_col = 'gruppo_id' if is_group else 'contatto_id'
-            cursor.execute(f"SELECT vault FROM {table} WHERE proprietario = ? AND {id_col} = ?", (username, chat_id_cif))
+            cursor.execute(f"SELECT ratchet_vault FROM {table} WHERE proprietario = ? AND {id_col} = ?", (username, chat_id_cif))
             risultato = cursor.fetchone()
 
             if not risultato or not risultato[0]:
@@ -240,12 +240,12 @@ def store_public_key_in_vault(
     try:
         with get_connection() as conn:
             cursor = conn.cursor()
-            table = 'contatti_gruppo' if is_group else 'contatti'
+            table = 'sessioni_gruppo' if is_group else 'sessioni_ratchet'
             id_col = 'gruppo_id' if is_group else 'contatto_id'
             if insert_new_vault:
-                cursor.execute(f"INSERT INTO {table} (proprietario, {id_col}, vault) VALUES (?, ?, ?)", (username, chat_id_cif, vault_cifrato))
+                cursor.execute(f"INSERT INTO {table} (proprietario, {id_col}, ratchet_vault) VALUES (?, ?, ?)", (username, chat_id_cif, vault_cifrato))
             else:
-                cursor.execute(f"UPDATE {table} SET vault = ? WHERE proprietario = ? AND {id_col} = ?", (vault_cifrato, username, chat_id_cif))
+                cursor.execute(f"UPDATE {table} SET ratchet_vault = ? WHERE proprietario = ? AND {id_col} = ?", (vault_cifrato, username, chat_id_cif))
             conn.commit()
     except sqlite3.Error:
         return False
@@ -265,7 +265,7 @@ def get_group_chyper_keys(data, chat_id1) -> list[str]:
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT vault FROM contatti_gruppo WHERE proprietario = ? AND gruppo_id = ?",
+                "SELECT ratchet_vault FROM sessioni_gruppo WHERE proprietario = ? AND gruppo_id = ?",
                 (username, chat_id)
             )
             risultato = cursor.fetchone()
@@ -306,7 +306,7 @@ def get_chat_chyper_keys(data, chat_id1) -> list[str]:
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT vault FROM contatti WHERE proprietario = ? AND contatto_id = ?",
+                "SELECT ratchet_vault FROM sessioni_ratchet WHERE proprietario = ? AND contatto_id = ?",
                 (username, chat_id)
             )
             risultato = cursor.fetchone()

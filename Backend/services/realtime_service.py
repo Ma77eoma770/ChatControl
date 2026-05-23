@@ -38,7 +38,7 @@ async def _remove_user_from_vault(temp_id: str, chat_id: int, user_id: int | Non
             cursor = conn.cursor()
             if is_group:
                 cursor.execute(
-                    """SELECT vault FROM contatti_gruppo WHERE proprietario = ? AND gruppo_id = ?""",
+                    """SELECT ratchet_vault FROM sessioni_gruppo WHERE proprietario = ? AND gruppo_id = ?""",
                     (username, chat_id_cif)
                 )
                 risultato = cursor.fetchone()
@@ -51,13 +51,13 @@ async def _remove_user_from_vault(temp_id: str, chat_id: int, user_id: int | Non
                 del partecipanti[str(user_id)]
                 vault_cifrato = cifra_vault(vault_deciphered, user_data['data']['masterkey'])
                 cursor.execute(
-                    """UPDATE contatti_gruppo SET vault = ? WHERE proprietario = ? AND gruppo_id = ?""",
+                    """UPDATE sessioni_gruppo SET ratchet_vault = ? WHERE proprietario = ? AND gruppo_id = ?""",
                     (vault_cifrato, username, chat_id_cif)
                 )
                 conn.commit()
             else:
                 cursor.execute(
-                    """DELETE FROM contatti WHERE proprietario = ? AND contatto_id = ?""",
+                    """DELETE FROM sessioni_ratchet WHERE proprietario = ? AND contatto_id = ?""",
                     (username, chat_id_cif)
                 )
                 conn.commit()
@@ -128,9 +128,9 @@ def register_telethon_handlers(client, temp_id: str, login_session: str):
                 cif_flag = parsed.get("CIF") or parsed.get("cif")
                 chat_keys = data['data'].get('chats', {}).get(chat_id_cif, {})
 
-                if cif_flag == "in":
+                if cif_flag in ("in", "dr_init", "dr_ack"):
                     message_data = await _process_key_exchange(temp_id, event, message_data, parsed)
-                elif cif_flag == "on":
+                elif cif_flag in ("on", "dr_msg"):
                     message_data = await _process_text_message(event, message_data, parsed, chat_keys, data)
                 elif cif_flag == "message":
                     message_data = await _process_document_payload(client, entity, event, message_data, parsed, chat_keys, data)

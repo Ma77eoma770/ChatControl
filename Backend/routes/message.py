@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 from services.message_service import (
     delete_message_logic, send_file_logic, 
-    send_message_logic, send_public_key_logic
+    send_message_logic, send_dr_init_logic
 )
 
 router = APIRouter()
@@ -55,4 +55,4 @@ async def send_message(credentials: MessagePayload, login_session: str = Cookie(
 async def send_public_key(credentials: InitKey, login_session: str = Cookie(None)):
     """Genera una coppia di chiavi per la chat, aggiorna il Vault e invia la chiave pubblica."""
     # Rotta solitamente invocata alla prima apertura di una chat crittografata
-    return await send_public_key_logic(credentials.chat_id, login_session)
+    return await send_dr_init_logic(credentials.chat_id, login_session)

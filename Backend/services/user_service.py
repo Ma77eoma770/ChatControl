@@ -70,7 +70,7 @@ def get_gruppo_vault(username: str, chat_id: str, entity, data: dict) -> tuple[b
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT vault FROM contatti_gruppo WHERE proprietario = ? AND gruppo_id = ?""",
+            """SELECT ratchet_vault FROM sessioni_gruppo WHERE proprietario = ? AND gruppo_id = ?""",
             (username, chat_id_cif)
         )
         risultato = cursor.fetchone()
@@ -95,7 +95,7 @@ async def get_chat_vault(username: str, chat_id: str, client, data: dict) -> tup
     with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            """SELECT vault FROM contatti WHERE proprietario = ? AND contatto_id = ?""",
+            """SELECT ratchet_vault FROM sessioni_ratchet WHERE proprietario = ? AND contatto_id = ?""",
             (username, chat_id_cif)
         )
         risultato = cursor.fetchone()

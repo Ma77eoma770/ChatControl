@@ -20,24 +20,38 @@ def initDB():
                 vault BLOB)"""
               )
 
-    # TABELLA CONTATTI: memorizza le chiavi scambiate per le singole chat private (1 a 1).
-    # - contatto_id: hash dell'ID telegram del contatto
-    # - vault: sub-vault cifrato contenente la cronologia delle chiavi 'age' scambiate con quel contatto
-    c.execute("""CREATE TABLE IF NOT EXISTS contatti (
+    # TABELLA PREKEYS: memorizza le chiavi pubbliche per l'inizializzazione asincrona X3DH.
+    c.execute("""CREATE TABLE IF NOT EXISTS prekeys (
+                username TEXT PRIMARY KEY,
+                identity_key_pub TEXT,
+                signed_prekey_pub TEXT,
+                signed_prekey_sig TEXT,
+                FOREIGN KEY (username) REFERENCES utenti(username) ON DELETE CASCADE)"""
+              )
+
+    # TABELLA ONE TIME PREKEYS: memorizza le OTPK pubbliche per X3DH.
+    c.execute("""CREATE TABLE IF NOT EXISTS one_time_prekeys (
+                username TEXT,
+                key_id INTEGER,
+                pub_key TEXT,
+                FOREIGN KEY (username) REFERENCES utenti(username) ON DELETE CASCADE,
+                PRIMARY KEY (username, key_id))"""
+              )
+
+    # TABELLA SESSIONI RATCHET: memorizza lo stato cifrato delle sessioni 1-a-1 Double Ratchet.
+    c.execute("""CREATE TABLE IF NOT EXISTS sessioni_ratchet (
                 proprietario TEXT,
                 contatto_id TEXT,
-                vault BLOB,
+                ratchet_vault BLOB,
                 FOREIGN KEY (proprietario) REFERENCES utenti(username) ON DELETE CASCADE ON UPDATE CASCADE,
                 PRIMARY KEY (proprietario, contatto_id))"""
               )
 
-    # TABELLA CONTATTI GRUPPO: memorizza le chiavi 'age' all'interno delle chat di gruppo.
-    # - gruppo_id: hash dell'ID telegram del gruppo
-    # - vault: sub-vault cifrato contenente le chiavi 'age' di tutti i partecipanti al gruppo
-    c.execute("""CREATE TABLE IF NOT EXISTS contatti_gruppo (
+    # TABELLA SESSIONI GRUPPO: predisposizione per le sessioni di gruppo (Envelope Encryption).
+    c.execute("""CREATE TABLE IF NOT EXISTS sessioni_gruppo (
                 proprietario TEXT,
                 gruppo_id TEXT,
-                vault BLOB,
+                ratchet_vault BLOB,
                 FOREIGN KEY (proprietario) REFERENCES utenti (username) ON DELETE CASCADE ON UPDATE CASCADE,
                 PRIMARY KEY (proprietario, gruppo_id))"""
               )

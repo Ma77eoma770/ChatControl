@@ -59,9 +59,9 @@ async def get_chats_logic(login_session: str, offset_date: str = None):
         with get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                """SELECT contatto_id FROM contatti WHERE proprietario = ?
+                """SELECT contatto_id FROM sessioni_ratchet WHERE proprietario = ?
                    UNION
-                   SELECT gruppo_id FROM contatti_gruppo WHERE proprietario = ?""",
+                   SELECT gruppo_id FROM sessioni_gruppo WHERE proprietario = ?""",
                 (username, username)
             )
             risultati = cursor.fetchall()
@@ -374,6 +374,60 @@ async def _handle_encrypted_document_payload(message: dict, client, entity, data
     message['is_json'] = False
     message.pop('json', None)
 
+def _handle_dr_init_ack(message: dict, my_id: int):
+    cif_flag = message['json'].get('cif') or message['json'].get('CIF')
+    is_mine = (my_id and message.get('sender_id') == my_id)
+    action = "Init" if cif_flag == "dr_init" else "Ack"
+    direz = "(Inviato)" if is_mine else "(Ricevuto)"
+    message.update({
+        'text': None, 
+        'chiave': f"Double Ratchet {action} {direz}", 
+        'is_system': True, 
+        'is_json': False
+    })
+    message.pop('json', None)
+
+def _handle_dr_msg(message: dict, chat_id: int, data: dict, my_id: int):
+    envelope = message['json'].get('envelope')
+    if not envelope: return
+
+    is_mine = (my_id and message.get('sender_id') == my_id)
+    if is_mine:
+        message.update({
+             'text': 'Messaggio cifrato inviato (Double Ratchet)', 
+             'secure': True,
+             'is_json': False
+        })
+        message.pop('json', None)
+        return
+
+    masterkey = data['data']['masterkey']
+    username = hashlib.sha256(pepper.encode() + data['data']['username'].encode()).hexdigest()
+    chat_id_hash = hashlib.sha256(pepper.encode() + str(chat_id).encode()).hexdigest()
+    is_group = is_group_chat_id(chat_id)
+
+    from services.double_ratchet_service import load_ratchet_state, envelope_decrypt, save_ratchet_state
+
+    state = load_ratchet_state(username, is_group, chat_id_hash, masterkey)
+    if not state:
+        message['error'] = "Impossibile decifrare: Stato Ratchet mancante"
+        message['is_json'] = False
+        message.pop('json', None)
+        return
+
+    try:
+        text_decifrato, updated_state = envelope_decrypt(envelope, chat_id_hash, state)
+        save_ratchet_state(username, is_group, chat_id_hash, masterkey, updated_state)
+
+        dizionario = json.loads(text_decifrato.decode('utf-8'))
+        message['text'] = dizionario.get('text', 'Decifrato ma testo vuoto')
+        message['secure'] = True
+    except Exception as e:
+        traceback.print_exc()
+        message['error'] = f"Errore decifratura Double Ratchet: {e}"
+
+    if 'json' in message: del message['json']
+    message['is_json'] = False
 
 async def get_chat_messages_logic(chat_id: int, limit: int, start: int, login_session: str):
     temp_id, data = is_logged_in(login_session, False)
@@ -448,6 +502,7 @@ async def get_chat_messages_logic(chat_id: int, limit: int, start: int, login_se
     
     _populate_decrypted_ids(messages_in_window, data, chat_keys)
 
+    messages.reverse() 
     for message in messages:
         if message['system_type']:
             continue
@@ -458,6 +513,10 @@ async def get_chat_messages_logic(chat_id: int, limit: int, start: int, login_se
         
         if cif_flag == "in":
             _handle_key_exchange(message, entity, chat_id, data, my_id)
+        elif cif_flag in ("dr_init", "dr_ack"):
+            _handle_dr_init_ack(message, my_id)
+        elif cif_flag == "dr_msg":
+            _handle_dr_msg(message, chat_id, data, my_id)
         elif cif_flag == "on":
              _handle_encrypted_text(message, data, chat_keys)
         elif cif_flag == "file":
@@ -465,7 +524,6 @@ async def get_chat_messages_logic(chat_id: int, limit: int, start: int, login_se
         elif cif_flag == "message":
             await _handle_encrypted_document_payload(message, client, entity, data, chat_keys)
 
-    messages.reverse() 
     return {"chat_id": chat_id, "messages": messages}
 
 async def get_init_messages_logic(chat_id: int, login_session: str):
@@ -572,14 +630,14 @@ async def get_init_messages_logic(chat_id: int, login_session: str):
                 cursor = conn.cursor()
                 if is_group:
                     if insert_new_vault:
-                        cursor.execute("""INSERT INTO contatti_gruppo (proprietario, gruppo_id, vault) VALUES (?, ?, ?)""", (username, chat_id_cif, vault_cifrato))
+                        cursor.execute("""INSERT INTO sessioni_gruppo (proprietario, gruppo_id, ratchet_vault) VALUES (?, ?, ?)""", (username, chat_id_cif, vault_cifrato))
                     else:
-                        cursor.execute("""UPDATE contatti_gruppo SET vault = ? WHERE proprietario = ? AND gruppo_id = ?""", (vault_cifrato, username, chat_id_cif))
+                        cursor.execute("""UPDATE sessioni_gruppo SET ratchet_vault = ? WHERE proprietario = ? AND gruppo_id = ?""", (vault_cifrato, username, chat_id_cif))
                 else:
                     if insert_new_vault:
-                        cursor.execute("""INSERT INTO contatti (proprietario, contatto_id, vault) VALUES (?, ?, ?)""", (username, chat_id_cif, vault_cifrato))
+                        cursor.execute("""INSERT INTO sessioni_ratchet (proprietario, contatto_id, ratchet_vault) VALUES (?, ?, ?)""", (username, chat_id_cif, vault_cifrato))
                     else:
-                        cursor.execute("""UPDATE contatti SET vault = ? WHERE proprietario = ? AND contatto_id = ?""", (vault_cifrato, username, chat_id_cif))
+                        cursor.execute("""UPDATE sessioni_ratchet SET ratchet_vault = ? WHERE proprietario = ? AND contatto_id = ?""", (vault_cifrato, username, chat_id_cif))
                 conn.commit()
         except sqlite3.Error as error:
             raise HTTPException(status_code=500, detail=str(error))
