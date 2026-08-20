@@ -17,7 +17,8 @@ from services.auth_service import is_logged_in
 from services.crypto_service import (
     cifra_payload, genera_chiavi, cifra_vault, 
     get_chat_chyper_keys, get_group_chyper_keys,
-    cifra_payload_stream
+    cifra_payload_stream, cifra_payload_dr,
+    get_or_create_dr_session, save_dr_session_to_vault
 )
 from services.telegram_service import split_message
 from services.user_service import set_user_vault
@@ -235,8 +236,22 @@ async def send_message_logic(chat_id: int, text: str, cryph: bool, group: bool, 
         }
 
         json_da_cifrare = json.dumps(da_cifrare, sort_keys=True)
-        text_cyp = cifra_payload(json_da_cifrare, recipient_keys)
-        encrypted_id = cifra_payload(id_message, recipient_keys)
+
+        if not group:
+            dr_session, vault_deciphered = get_or_create_dr_session(data, chat_id, is_initiator=True)
+            text_cyp = None
+            if dr_session and dr_session.cks:
+                text_cyp = cifra_payload_dr(json_da_cifrare, dr_session)
+                if text_cyp:
+                    encrypted_id = cifra_payload(id_message, recipient_keys)
+                    save_dr_session_to_vault(data, chat_id, dr_session, vault_deciphered)
+
+            if not text_cyp:
+                text_cyp = cifra_payload(json_da_cifrare, recipient_keys)
+                encrypted_id = cifra_payload(id_message, recipient_keys)
+        else:
+            text_cyp = cifra_payload(json_da_cifrare, recipient_keys)
+            encrypted_id = cifra_payload(id_message, recipient_keys)
         
         if text_cyp is None or encrypted_id is None:
             raise HTTPException(status_code=500, detail="Errore durante la cifratura con age")
@@ -270,10 +285,17 @@ async def send_message_logic(chat_id: int, text: str, cryph: bool, group: bool, 
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Invio fallito: {e}")
             
+        user_pub = chat_data.get('chiave', {}).get('pubblica') if 'chat_data' in locals() else None
+        self_keys = [user_pub] if user_pub else recipient_keys
+        self_cyp = cifra_payload(json_da_cifrare, self_keys)
+        recip_cyp = cifra_payload(json_da_cifrare, recipient_keys)
+
         finale = {
             "cif": "on",
             "text": text_cyp,
             "id": encrypted_id,
+            "self_text": self_cyp,
+            "recip_text": recip_cyp,
         }
         
         try:

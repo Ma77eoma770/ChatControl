@@ -7,7 +7,8 @@ from core.config import pepper
 from services.auth_service import get_user_data_by_temp_id
 from services.telegram_service import is_group_chat_id
 from services.crypto_service import (
-    is_valid_public_key, store_public_key_in_vault, decifra_payload
+    is_valid_public_key, store_public_key_in_vault, decifra_payload,
+    get_or_create_dr_session, save_dr_session_to_vault
 )
 
 async def _process_key_exchange(temp_id, event, message_data, parsed):
@@ -41,8 +42,10 @@ async def _process_key_exchange(temp_id, event, message_data, parsed):
     return message_data
 
 async def _process_text_message(event, message_data, parsed, chat_keys, data):
-    """Gestisce la ricezione di payload testuale cifrato con crittografia age (via MTProto)."""
+    """Gestisce la ricezione di payload testuale cifrato (via MTProto)."""
     text_encrypted = message_data['json'].get('text')
+    self_text_encrypted = message_data['json'].get('self_text')
+    recip_text_encrypted = message_data['json'].get('recip_text')
     id_message_encrypted = message_data['json'].get('id')
     timestamp = message_data.get('date')
 
@@ -50,8 +53,32 @@ async def _process_text_message(event, message_data, parsed, chat_keys, data):
     priv = chat_keys.get('chiave', {}).get('privata')
     candidate_privates = [priv] if priv else []
 
-    # Tenta la decifratura asimmetrica passando come input le stringhe in base64
-    text_decifrato = decifra_payload(text_encrypted, candidate_privates)
+    is_out = message_data.get('out') or getattr(event.message, 'out', False)
+
+    text_decifrato = None
+    if is_out and self_text_encrypted:
+        text_decifrato = decifra_payload(self_text_encrypted, candidate_privates)
+
+    if not text_decifrato and not is_out:
+        dr_session = None
+        vault_deciphered = None
+        chat_id = getattr(event, 'chat_id', None)
+        if chat_id and not is_group_chat_id(chat_id):
+            dr_session, vault_deciphered = get_or_create_dr_session(data, chat_id, is_initiator=False)
+
+        # Tenta la decifratura asimmetrica passando come input le stringhe in base64
+        text_decifrato = decifra_payload(text_encrypted, candidate_privates, dr_session=dr_session)
+        if text_decifrato and dr_session and chat_id:
+            save_dr_session_to_vault(data, chat_id, dr_session, vault_deciphered)
+
+        if not text_decifrato and recip_text_encrypted:
+            text_decifrato = decifra_payload(recip_text_encrypted, candidate_privates)
+
+    if not text_decifrato:
+        text_decifrato = decifra_payload(text_encrypted, candidate_privates)
+        if not text_decifrato and self_text_encrypted:
+            text_decifrato = decifra_payload(self_text_encrypted, candidate_privates)
+
     if text_decifrato:
         text_decifrato = text_decifrato.decode() if isinstance(text_decifrato, bytes) else text_decifrato
 
@@ -72,14 +99,16 @@ async def _process_text_message(event, message_data, parsed, chat_keys, data):
                     except (TypeError, ValueError):
                         diff_seconds = None
 
-                if (diff_seconds is not None and diff_seconds > 10) or (id_message_decifrato_caption in data['ids_']):
+                target_id = id_message_decifrato_caption or id_message_decifrato
+                if (diff_seconds is not None and diff_seconds > 120):
                     message_data['error'] = "questo messaggio e' frutto di un replay attack"
-                elif id_message_decifrato_caption != id_message_decifrato:
+                elif id_message_decifrato_caption and id_message_decifrato_caption != id_message_decifrato:
                     message_data['error'] = "questo messaggio e' stato modificato"
                 else:
                     message_data['text'] = dizionario['text']
                     message_data['secure'] = True
-                    data['ids_'].add(id_message_decifrato_caption)
+                    if target_id:
+                        data['ids_'].add(target_id)
             else:
                 message_data['error'] = "questo messaggio e' stato modificato"
         except Exception:

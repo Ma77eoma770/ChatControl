@@ -39,9 +39,7 @@ async def chat_events(websocket: WebSocket, chat_id: int):
     except WebSocketDisconnect:
         pass
     finally:
-        # Pulizia dello stato locale della chat (es. per il controllo sui replay attack) e del socket
-        data['ids_'] = set()
-        data['active_chat_id'] = None
+        # Disconnette il socket senza azzerare l'insieme dei messaggi anti-replay
         await disconnect_socket(temp_id, chat_id, websocket)
 
 @router.get("/chats")

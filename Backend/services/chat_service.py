@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from core.config import pepper
 from services.crypto_service import (
     cifra_vault, is_valid_public_key, store_public_key_in_vault,
-    decifra_payload
+    decifra_payload, get_or_create_dr_session, save_dr_session_to_vault
 )
 from services.auth_service import is_logged_in
 from services.telegram_service import is_group_chat_id, set_media
@@ -145,7 +145,7 @@ def _calculate_time_window(messages: list) -> tuple[datetime | None, datetime | 
                         window_start = candidate_start
             if cif_flag == "on" and (window_start is None or message['date'] < window_start):
                 window_start = message['date']
-                
+
     if window_end is not None:
         if window_start is None:
             window_start = window_end - timedelta(seconds=10)
@@ -203,14 +203,40 @@ def _handle_key_exchange(message: dict, entity, chat_id: int, data: dict, my_id:
         'text': None, 'chiave': "Questo messaggio e' uno scambio di chiave", 'is_system': True
     })
 
-def _handle_encrypted_text(message: dict, data: dict, chat_keys: dict):
+def _handle_encrypted_text(message: dict, data: dict, chat_keys: dict, chat_id: int | None = None):
     text_enc = message['json'].get('text')
+    self_text_enc = message['json'].get('self_text')
+    recip_text_enc = message['json'].get('recip_text')
     timestamp = message.get('date')
     id_enc = message['json'].get('id')
 
     priv = chat_keys.get('chiave', {}).get('privata')
     candidates = [priv] if priv else []
-    text_dec = decifra_payload(text_enc, candidates)
+
+    is_outgoing = message.get('out', False)
+
+    text_dec = None
+    if is_outgoing and self_text_enc:
+        text_dec = decifra_payload(self_text_enc, candidates)
+
+    if not text_dec and not is_outgoing:
+        dr_session = None
+        vault_deciphered = None
+        if chat_id and not is_group_chat_id(chat_id):
+            dr_session, vault_deciphered = get_or_create_dr_session(data, chat_id, is_initiator=False)
+
+        text_dec = decifra_payload(text_enc, candidates, dr_session=dr_session)
+        if text_dec and dr_session and chat_id:
+            save_dr_session_to_vault(data, chat_id, dr_session, vault_deciphered)
+
+        if not text_dec and recip_text_enc:
+            text_dec = decifra_payload(recip_text_enc, candidates)
+
+    if not text_dec:
+        text_dec = decifra_payload(text_enc, candidates)
+        if not text_dec and self_text_enc:
+            text_dec = decifra_payload(self_text_enc, candidates)
+
     if text_dec:
         text_dec = text_dec.decode('utf-8') if isinstance(text_dec, bytes) else text_dec
 
@@ -226,14 +252,16 @@ def _handle_encrypted_text(message: dict, data: dict, chat_keys: dict):
                 id_dec = diz.get('id')
                 diff_sec = abs(timestamp.timestamp() - float(tempo_dec)) if (timestamp and tempo_dec is not None) else None
                 
-                if (diff_sec is not None and diff_sec > 10) or (id_dec_cap in data['ids_']):
+                target_id = id_dec_cap or id_dec
+                if (diff_sec is not None and diff_sec > 120):
                     message['error'] = "questo messaggio e' frutto di un replay attack"
-                elif id_dec_cap != id_dec:
+                elif id_dec_cap and id_dec_cap != id_dec:
                     message['error'] = "questo messaggio e' stato modificato"
                 else:
                     message['text'] = diz['text']
                     message['secure'] = True
-                    data['ids_'].add(id_dec_cap)
+                    if target_id:
+                        data['ids_'].add(target_id)
             else:
                 message['error'] = "questo messaggio e' stato modificato"
         except Exception:
@@ -459,7 +487,7 @@ async def get_chat_messages_logic(chat_id: int, limit: int, start: int, login_se
         if cif_flag == "in":
             _handle_key_exchange(message, entity, chat_id, data, my_id)
         elif cif_flag == "on":
-             _handle_encrypted_text(message, data, chat_keys)
+             _handle_encrypted_text(message, data, chat_keys, chat_id)
         elif cif_flag == "file":
             await _handle_encrypted_file(message, client, entity, data, chat_keys)
         elif cif_flag == "message":
@@ -714,10 +742,6 @@ async def download_encrypt_media_logic(chat_id: int, message_id: int, login_sess
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-
-                yield bytes(buffer)
-            async for chunk in decrypted_stream:
-                yield chunk
                 
         return StreamingResponse(
             _file_stream_generator(), media_type=mime_type,

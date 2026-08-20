@@ -61,7 +61,7 @@ def _build_and_store_vault(temp_data: dict, session_str: str, response: Response
         "time": time.time(),
         "client": client
     }
-    register_telethon_handlers(client, temp_id)
+    register_telethon_handlers(client, temp_id, temp_id_encrypted)
 
     response.set_cookie(
         key="login_session",

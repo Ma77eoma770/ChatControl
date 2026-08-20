@@ -23,6 +23,7 @@ async def upload_file(client: TelegramClient, file_path: str, progress_callback=
     is_large = file_size > 10 * 1024 * 1024
 
     uploaded_bytes = 0
+    upload_lock = asyncio.Lock()
 
     async def _upload_part(part_index: int):
         nonlocal uploaded_bytes
@@ -36,9 +37,10 @@ async def upload_file(client: TelegramClient, file_path: str, progress_callback=
             req = SaveFilePartRequest(file_id, part_index, chunk)
             
         await client(req)
-        uploaded_bytes += len(chunk)
-        if progress_callback:
-            await progress_callback(uploaded_bytes, file_size)
+        async with upload_lock:
+            uploaded_bytes += len(chunk)
+            if progress_callback:
+                await progress_callback(uploaded_bytes, file_size)
 
     # Use a semaphore to limit concurrency and avoid FloodWaits
     semaphore = asyncio.Semaphore(5)
@@ -80,14 +82,15 @@ async def download_file(client: TelegramClient, location, out_file: str, file_si
     except Exception:
         input_location = location
 
-    total_parts = math.ceil(file_size / CHUNK_SIZE)
+    total_parts = math.ceil(file_size / CHUNK_SIZE) if file_size > 0 else 0
     downloaded_bytes = 0
     lock = asyncio.Lock()
 
     # Pre-alloca il file
     with open(out_file, 'wb') as f:
-        f.seek(file_size - 1)
-        f.write(b'\0')
+        if file_size > 0:
+            f.seek(file_size - 1)
+            f.write(b'\0')
 
     semaphore = asyncio.Semaphore(5)
 

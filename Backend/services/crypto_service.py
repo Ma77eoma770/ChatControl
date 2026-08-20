@@ -20,11 +20,13 @@ from database.sqlite import get_connection
 _STREAM_MAGIC = b"CCV3"
 
 
-def deriva_master_key(passphrase: str, salt: bytes) -> bytes:
+def deriva_master_key(passphrase: str, salt: bytes | str) -> bytes:
     """
     Deriva una master key crittografica a partire da una passphrase e un salt
     utilizzando Argon2id. Restituisce la chiave in formato base64 url-safe.
     """
+    if isinstance(salt, str):
+        salt = salt.encode('utf-8')
     kdf = Argon2id(salt=salt, length=32, iterations=2, memory_cost=65536, lanes=4)
     raw_key = kdf.derive(passphrase.encode())
     return base64.urlsafe_b64encode(raw_key)
@@ -46,15 +48,189 @@ def cifra_vault(dizionario: dict, master_key) -> str:
 def decifra_vault(blob_cifrato, master_key) -> dict:
     """
     Decifra un blob PyNaCl SecretBox restituendo il dizionario originale.
-    Solleva ValueError in caso di fallimento.
+    Solleva ValueError in caso di password errata o fallimento nella decifratura.
     """
-    raw_key = base64.urlsafe_b64decode(master_key)
-    box = nacl.secret.SecretBox(raw_key)
-    raw_blob = base64.b64decode(blob_cifrato.encode() if isinstance(blob_cifrato, str) else blob_cifrato)
-    nonce = raw_blob[:nacl.secret.SecretBox.NONCE_SIZE]
-    ciphertext = raw_blob[nacl.secret.SecretBox.NONCE_SIZE:]
-    decrypted_bytes = box.decrypt(ciphertext, nonce)
-    return json.loads(decrypted_bytes.decode('utf-8'))
+    try:
+        raw_key = base64.urlsafe_b64decode(master_key)
+        box = nacl.secret.SecretBox(raw_key)
+        raw_blob = base64.b64decode(blob_cifrato.encode() if isinstance(blob_cifrato, str) else blob_cifrato)
+        nonce = raw_blob[:nacl.secret.SecretBox.NONCE_SIZE]
+        ciphertext = raw_blob[nacl.secret.SecretBox.NONCE_SIZE:]
+        decrypted_bytes = box.decrypt(ciphertext, nonce)
+        return json.loads(decrypted_bytes.decode('utf-8'))
+    except Exception as e:
+        raise ValueError("Password errata o vault non decifrabile.") from e
+
+
+from services.double_ratchet import DoubleRatchetSession
+
+
+def cifra_payload_dr(plaintext: str | bytes, dr_session: DoubleRatchetSession) -> str | None:
+    """
+    Cifra un testo o byte tramite DoubleRatchetSession e restituisce l'envelope codificato in base64 JSON.
+    Restituisce None se la sessione non è in uno stato pronto per l'invio.
+    """
+    try:
+        dr_envelope = dr_session.encrypt(plaintext)
+        hdr = dr_envelope.get("header", {})
+        dh_short = hdr.get("dh_pub", "")[:12]
+        print(f"🔒 [DoubleRatchet ENCRYPT] dh_pub={dh_short}... n={hdr.get('n')} pn={hdr.get('pn')}")
+        json_bytes = json.dumps(dr_envelope).encode('utf-8')
+        return base64.b64encode(json_bytes).decode('utf-8')
+    except Exception as e:
+        print(f"⚠️ [DoubleRatchet ENCRYPT ERROR] {e}")
+        return None
+
+
+def derive_shared_secret(my_priv_b64: str, remote_pub_b64: str) -> bytes:
+    """Deriva la Master Shared Secret (32 byte) tramite ECDH (X25519) ed HKDF-SHA256."""
+    my_priv = X25519PrivateKey.from_private_bytes(base64.b64decode(my_priv_b64))
+    remote_pub = X25519PublicKey.from_public_bytes(base64.b64decode(remote_pub_b64))
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"\x00" * 32,
+        info=b"ChatControl DoubleRatchet SharedSecret"
+    ).derive(my_priv.exchange(remote_pub))
+
+
+def get_or_create_dr_session(
+    data: dict, 
+    chat_id1: int | str, 
+    is_initiator: bool = True, 
+    remote_pub_override: str | None = None
+) -> tuple[DoubleRatchetSession | None, dict | None]:
+    """
+    Recupera la sessione DoubleRatchet per una chat 1:1 dal vault del contatto in SQLite.
+    Se non esiste ancora, la inizializza (init_alice se initiator, init_bob se receiver) e la salva.
+    Restituisce la tupla (dr_session, vault_deciphered).
+    """
+    if not data or 'data' not in data:
+        return None, None
+
+    username = hashlib.sha256(pepper.encode() + data['data']['username'].encode()).hexdigest()
+    chat_id_hash = hashlib.sha256(pepper.encode() + str(chat_id1).encode()).hexdigest()
+    masterkey = data['data'].get('masterkey')
+    if not masterkey:
+        return None, None
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT vault FROM contatti WHERE proprietario = ? AND contatto_id = ?",
+                (username, chat_id_hash)
+            )
+            risultato = cursor.fetchone()
+    except sqlite3.Error:
+        return None, None
+
+    vault_deciphered = None
+    if risultato and risultato[0]:
+        try:
+            vault_deciphered = decifra_vault(risultato[0], masterkey)
+        except Exception:
+            vault_deciphered = None
+
+    if not vault_deciphered:
+        vault_deciphered = {'user_id': chat_id1, 'username': str(chat_id1), 'chiavi': []}
+
+    # Se dr_session è già registrato nel sub-vault del contatto
+    if 'dr_session' in vault_deciphered and vault_deciphered['dr_session']:
+        try:
+            session = DoubleRatchetSession.from_dict(vault_deciphered['dr_session'])
+            if is_initiator and session.cks is None and session.ns == 0 and session.nr == 0:
+                remote_pub_b64 = remote_pub_override
+                if not remote_pub_b64:
+                    all_keys = vault_deciphered.get('chiavi', [])
+                    active_keys = [k['chiave'] for k in all_keys if k.get('fine') is None and k.get('chiave')]
+                    if active_keys:
+                        remote_pub_b64 = active_keys[0]
+                chat_data = data.get('data', {}).get('chats', {}).get(chat_id_hash, {})
+                my_priv_b64 = chat_data.get('chiave', {}).get('privata')
+                if my_priv_b64 and remote_pub_b64:
+                    shared_secret = derive_shared_secret(my_priv_b64, remote_pub_b64)
+                    session = DoubleRatchetSession.init_alice(shared_secret, remote_pub_b64)
+                    vault_deciphered['dr_session'] = session.to_dict()
+                    save_dr_session_to_vault(data, chat_id1, session, vault_deciphered)
+            return session, vault_deciphered
+        except Exception:
+            pass
+
+    # Recupera le chiavi per l'inizializzazione
+    chat_data = data.get('data', {}).get('chats', {}).get(chat_id_hash, {})
+    my_priv_b64 = chat_data.get('chiave', {}).get('privata')
+    if not my_priv_b64:
+        return None, vault_deciphered
+
+    remote_pub_b64 = remote_pub_override
+    if not remote_pub_b64:
+        all_keys = vault_deciphered.get('chiavi', [])
+        active_keys = [k['chiave'] for k in all_keys if k.get('fine') is None and k.get('chiave')]
+        if active_keys:
+            remote_pub_b64 = active_keys[0]
+
+    if not remote_pub_b64:
+        return None, vault_deciphered
+
+    shared_secret = derive_shared_secret(my_priv_b64, remote_pub_b64)
+    if is_initiator:
+        session = DoubleRatchetSession.init_alice(shared_secret, remote_pub_b64)
+    else:
+        session = DoubleRatchetSession.init_bob(shared_secret, my_priv_b64)
+
+    vault_deciphered['dr_session'] = session.to_dict()
+    save_dr_session_to_vault(data, chat_id1, session, vault_deciphered)
+    return session, vault_deciphered
+
+
+def save_dr_session_to_vault(
+    data: dict, 
+    chat_id1: int | str, 
+    dr_session: DoubleRatchetSession, 
+    vault_deciphered: dict | None = None
+) -> bool:
+    """Salva lo stato aggiornato della sessione Double Ratchet nel vault del contatto in SQLite."""
+    if not dr_session or not data or 'data' not in data:
+        return False
+
+    username = hashlib.sha256(pepper.encode() + data['data']['username'].encode()).hexdigest()
+    chat_id_hash = hashlib.sha256(pepper.encode() + str(chat_id1).encode()).hexdigest()
+    masterkey = data['data'].get('masterkey')
+    if not masterkey:
+        return False
+
+    if vault_deciphered is None:
+        try:
+            with get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT vault FROM contatti WHERE proprietario = ? AND contatto_id = ?",
+                    (username, chat_id_hash)
+                )
+                risultato = cursor.fetchone()
+                if risultato and risultato[0]:
+                    vault_deciphered = decifra_vault(risultato[0], masterkey)
+                else:
+                    vault_deciphered = {'user_id': chat_id1, 'username': str(chat_id1), 'chiavi': []}
+        except Exception:
+            vault_deciphered = {'user_id': chat_id1, 'username': str(chat_id1), 'chiavi': []}
+
+    vault_deciphered['dr_session'] = dr_session.to_dict()
+    vault_cifrato = cifra_vault(vault_deciphered, masterkey)
+
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO contatti (proprietario, contatto_id, vault) VALUES (?, ?, ?) "
+                "ON CONFLICT(proprietario, contatto_id) DO UPDATE SET vault = excluded.vault",
+                (username, chat_id_hash, vault_cifrato)
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error:
+        return False
 
 
 def cifra_payload(plaintext: str | bytes, public_keys: list) -> str | None:
@@ -93,9 +269,9 @@ def cifra_payload(plaintext: str | bytes, public_keys: list) -> str | None:
         return None
 
 
-def decifra_payload(ciphertext, candidate_privates: list) -> bytes | None:
+def decifra_payload(ciphertext, candidate_privates: list, dr_session: DoubleRatchetSession | None = None) -> bytes | None:
     """
-    Decifra un payload cifrato con cifra_payload (envelope JSON v3).
+    Decifra un payload cifrato con Double Ratchet (dr_v1) o Envelope Encryption v3 (v: 3).
     candidate_privates: lista di chiavi private X25519 in formato base64.
     Ritorna i byte in chiaro oppure None se la decifratura fallisce.
     """
@@ -107,6 +283,30 @@ def decifra_payload(ciphertext, candidate_privates: list) -> bytes | None:
             input_bytes = raw_bytes
 
         envelope = json.loads(input_bytes.decode('utf-8'))
+        
+        # Supporto Double Ratchet envelope
+        if envelope.get("v") == "dr_v1":
+            hdr = envelope.get("header", {})
+            dh_short = hdr.get("dh_pub", "")[:12]
+            print(f"🔓 [DoubleRatchet DECRYPT] dh_pub={dh_short}... n={hdr.get('n')} pn={hdr.get('pn')}")
+            if dr_session:
+                return dr_session.decrypt(envelope)
+            elif candidate_privates and envelope.get("header", {}).get("dh_pub"):
+                # Inizializza automaticamente la sessione Bob se riceve il primo messaggio DR
+                dh_pub = envelope["header"]["dh_pub"]
+                my_priv_b64 = candidate_privates[0]
+                my_priv = X25519PrivateKey.from_private_bytes(base64.b64decode(my_priv_b64))
+                remote_pub = X25519PublicKey.from_public_bytes(base64.b64decode(dh_pub))
+                shared_secret = HKDF(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=b"\x00" * 32,
+                    info=b"ChatControl DoubleRatchet SharedSecret"
+                ).derive(my_priv.exchange(remote_pub))
+                session = DoubleRatchetSession.init_bob(shared_secret, my_priv_b64)
+                return session.decrypt(envelope)
+            return None
+
         if envelope.get("v") != 3:
             return None
 

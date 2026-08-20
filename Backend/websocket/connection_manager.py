@@ -1,4 +1,5 @@
 import asyncio
+import json
 from fastapi import WebSocket
 
 # temp_id -> chat_id -> set[WebSocket]
@@ -42,12 +43,14 @@ async def broadcast_event(temp_id: str, chat_id: int, payload: dict):
         sockets = list(_active_connections.get(temp_id, {}).get(chat_id, set()))
     if not sockets:
         return
+
+    # Normalizza e clona il payload una sola volta prima del ciclo
+    payload_to_send = json.loads(json.dumps(payload, default=str)) if isinstance(payload, dict) else payload
+
     dead = []
     for ws in sockets:
         try:
-            if payload.get('message') and payload.get('message').get('date'):
-                payload['message']['date']= payload['message']['date'].isoformat()
-            await ws.send_json(payload)
+            await ws.send_json(payload_to_send)
         except Exception as e:
             dead.append(ws)
     for ws in dead:

@@ -1,7 +1,9 @@
 import sqlite3
+import os
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATABASE_NAME = "database.db"
-DATABASE_PATH = "database/"+ DATABASE_NAME
+DATABASE_PATH = os.path.join(BASE_DIR, DATABASE_NAME)
 
 def initDB():
     """Inizializza la base dati creando le tabelle necessarie al funzionamento, se non esistono."""
