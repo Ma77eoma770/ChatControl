@@ -109,8 +109,14 @@ async def _process_text_message(event, message_data, parsed, chat_keys, data):
                     message_data['secure'] = True
                     if target_id:
                         data['ids_'].add(target_id)
+            elif dizionario.get('cif') == "dummy":
+                message_data['is_dummy'] = True
+                message_data['text'] = None
+                message_data['secure'] = True
+                return message_data
             else:
                 message_data['error'] = "questo messaggio e' stato modificato"
+
         except Exception:
             traceback.print_exc()
 

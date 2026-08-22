@@ -9,10 +9,11 @@ import io
 import time
 import hashlib
 
+import random
 from fastapi import HTTPException
 from telethon.tl.types import DocumentAttributeFilename
 
-from core.config import pepper
+from core.config import pepper, enable_dpi_obfuscation, jitter_min_ms, jitter_max_ms
 from services.auth_service import is_logged_in
 from services.crypto_service import (
     cifra_payload, genera_chiavi, cifra_vault, 
@@ -20,8 +21,10 @@ from services.crypto_service import (
     cifra_payload_stream, cifra_payload_dr,
     get_or_create_dr_session, save_dr_session_to_vault
 )
+from services.dpi_service import create_decoy_payload
 from services.telegram_service import split_message
 from services.user_service import set_user_vault
+
 
 CAPTION_LIMIT = 1024
 MESSAGE_LIMIT = 4096
@@ -298,12 +301,61 @@ async def send_message_logic(chat_id: int, text: str, cryph: bool, group: bool, 
             "recip_text": recip_cyp,
         }
         
+        if enable_dpi_obfuscation and jitter_max_ms > 0:
+            delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
+            await asyncio.sleep(delay_sec)
+
         try:
             await client.send_message(chat_id, json.dumps(finale))
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Invio fallito: {e}")
-            
+
     return {"status": "ok"}
+
+
+async def send_decoy_message_logic(chat_id: int, login_session: str, group: bool = False):
+    """
+    Invia un messaggio fittizio (civetta/dummy) cifrato per disturbare la frequenza e il pattern temporale IAT.
+    """
+    _, data = is_logged_in(login_session, True)
+    client = data['client']
+
+    if not client.is_connected():
+        await client.connect()
+
+    recipient_keys = get_group_chyper_keys(data, chat_id) if group else get_chat_chyper_keys(data, chat_id)
+    decoy_payload = create_decoy_payload()
+    json_decoy = json.dumps(decoy_payload, sort_keys=True)
+
+    text_cyp = cifra_payload(json_decoy, recipient_keys)
+    encrypted_id = cifra_payload(decoy_payload["id"], recipient_keys)
+
+    if not text_cyp or not encrypted_id:
+        return {"status": "error"}
+
+    user_pub = data.get('data', {}).get('chats', {}).get(hashlib.sha256(pepper.encode() + str(chat_id).encode()).hexdigest(), {}).get('chiave', {}).get('pubblica')
+    self_keys = [user_pub] if user_pub else recipient_keys
+    self_cyp = cifra_payload(json_decoy, self_keys)
+    recip_cyp = cifra_payload(json_decoy, recipient_keys)
+
+    finale = {
+        "cif": "on",
+        "text": text_cyp,
+        "id": encrypted_id,
+        "self_text": self_cyp,
+        "recip_text": recip_cyp,
+    }
+
+    if enable_dpi_obfuscation and jitter_max_ms > 0:
+        delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
+        await asyncio.sleep(delay_sec)
+
+    try:
+        await client.send_message(chat_id, json.dumps(finale))
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 
 async def send_public_key_logic(chat_id: int, login_session: str):
     _, data = is_logged_in(login_session, True)

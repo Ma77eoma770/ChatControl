@@ -43,10 +43,13 @@ class TestDoubleRatchetIntegration(unittest.TestCase):
         enc1_b64 = cifra_payload_dr(msg1_str, alice_session)
 
         # Decode raw envelope JSON
+        from services.dpi_service import revert_covert_mimicry
         raw_env1 = json.loads(base64.b64decode(enc1_b64).decode('utf-8'))
+        raw_env1 = revert_covert_mimicry(raw_env1)
         self.assertEqual(raw_env1.get("v"), "dr_v1")
         self.assertEqual(raw_env1["header"]["n"], 0)
         self.assertEqual(raw_env1["header"]["pn"], 0)
+
 
         # Bob decrypts Message 1
         dec1_bytes = decifra_payload(enc1_b64, [bob_priv], dr_session=bob_session)
@@ -107,11 +110,15 @@ class TestDoubleRatchetIntegration(unittest.TestCase):
         bob_session = DoubleRatchetSession.init_bob(shared_secret, bob_priv)
         # Bob decrypts Msg 1, 2, 3
         # Since Msg 1 & 2 were done by original session, restored session has ns=2
+        from services.dpi_service import revert_covert_mimicry, unpad_payload_from_bucket
         raw_env3 = json.loads(base64.b64decode(enc3_b64).decode('utf-8'))
+        raw_env3 = revert_covert_mimicry(raw_env3)
         self.assertEqual(raw_env3["header"]["n"], 2)
 
-        dec3 = bob_session.decrypt(raw_env3)
+        dec3_padded = bob_session.decrypt(raw_env3)
+        dec3 = unpad_payload_from_bucket(dec3_padded)
         self.assertEqual(dec3.decode('utf-8'), "Msg 3 da sessione ripristinata")
+
 
     def test_uninitialized_bob_encrypt_graceful_handling(self):
         bob_pub, bob_priv = genera_chiavi()

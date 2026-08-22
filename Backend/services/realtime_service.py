@@ -21,6 +21,8 @@ from websocket.message_processors import (
     _process_key_exchange, _process_text_message,
     _process_document_payload, _process_encrypted_file
 )
+from services.dpi_service import revert_covert_mimicry
+
 
 async def _remove_user_from_vault(temp_id: str, chat_id: int, user_id: int | None):
     """Rimuove l'utente dal vault segreto del gruppo se esce o viene rimosso, aggiornando il DB."""
@@ -117,6 +119,7 @@ def register_telethon_handlers(client, temp_id: str, login_session: str):
             try:
                 parsed = json.loads(text)
                 if isinstance(parsed, dict):
+                    parsed = revert_covert_mimicry(parsed)
                     message_data['json'] = parsed
                     message_data['is_json'] = True
                 else:
@@ -137,12 +140,17 @@ def register_telethon_handlers(client, temp_id: str, login_session: str):
                 elif cif_flag == "file":
                     message_data = await _process_encrypted_file(client, entity, event, message_data, parsed, chat_keys, data)
 
+            if message_data.get('is_dummy'):
+                # Pacchetto civetta/dummy Anti-DPI: scartato in silenzio, nessun broadcast WS o notifica
+                return
+
         payload = {
             "event_type": "new",
             "chat_id": event.chat_id,
             "message": message_data,
         }
         await broadcast_event(temp_id, event.chat_id, payload)
+
 
     async def handle_edited_message(event):
         if not event.chat_id:

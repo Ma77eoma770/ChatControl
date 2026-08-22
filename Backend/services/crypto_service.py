@@ -12,9 +12,12 @@ from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from fastapi import HTTPException
-from core.config import pepper
+from core.config import pepper, enable_dpi_obfuscation
 from database.sqlite import get_connection
+from services.dpi_service import (
+    pad_payload_to_bucket, unpad_payload_from_bucket,
+    apply_covert_mimicry, revert_covert_mimicry
+)
 
 # Magic bytes per il formato stream v3
 _STREAM_MAGIC = b"CCV3"
@@ -71,9 +74,18 @@ def cifra_payload_dr(plaintext: str | bytes, dr_session: DoubleRatchetSession) -
     Restituisce None se la sessione non è in uno stato pronto per l'invio.
     """
     try:
+        if isinstance(plaintext, str):
+            plaintext = plaintext.encode("utf-8")
+
+        if enable_dpi_obfuscation:
+            plaintext = pad_payload_to_bucket(plaintext)
+
         dr_envelope = dr_session.encrypt(plaintext)
-        hdr = dr_envelope.get("header", {})
-        dh_short = hdr.get("dh_pub", "")[:12]
+        if enable_dpi_obfuscation:
+            dr_envelope = apply_covert_mimicry(dr_envelope)
+
+        hdr = dr_envelope.get("header", {}) or dr_envelope.get("ref", {})
+        dh_short = str(hdr.get("dh_pub", ""))[:12]
         print(f"🔒 [DoubleRatchet ENCRYPT] dh_pub={dh_short}... n={hdr.get('n')} pn={hdr.get('pn')}")
         json_bytes = json.dumps(dr_envelope).encode('utf-8')
         return base64.b64encode(json_bytes).decode('utf-8')
@@ -254,6 +266,9 @@ def cifra_payload(plaintext: str | bytes, public_keys: list) -> str | None:
         if isinstance(plaintext, str):
             plaintext = plaintext.encode('utf-8')
 
+        if enable_dpi_obfuscation:
+            plaintext = pad_payload_to_bucket(plaintext)
+
         payload_box = nacl.secret.SecretBox(mmk)
         nonce_payload = nacl.utils.random(nacl.secret.SecretBox.NONCE_SIZE)
         encrypted_payload = payload_box.encrypt(plaintext, nonce_payload)
@@ -264,6 +279,9 @@ def cifra_payload(plaintext: str | bytes, public_keys: list) -> str | None:
             "deks": encrypted_deks,
             "data": base64.b64encode(encrypted_payload).decode('utf-8')
         }
+        if enable_dpi_obfuscation:
+            envelope = apply_covert_mimicry(envelope)
+
         return base64.b64encode(json.dumps(envelope).encode()).decode()
     except Exception:
         return None
@@ -283,14 +301,17 @@ def decifra_payload(ciphertext, candidate_privates: list, dr_session: DoubleRatc
             input_bytes = raw_bytes
 
         envelope = json.loads(input_bytes.decode('utf-8'))
-        
+        if enable_dpi_obfuscation:
+            envelope = revert_covert_mimicry(envelope)
+
         # Supporto Double Ratchet envelope
         if envelope.get("v") == "dr_v1":
             hdr = envelope.get("header", {})
-            dh_short = hdr.get("dh_pub", "")[:12]
+            dh_short = str(hdr.get("dh_pub", ""))[:12]
             print(f"🔓 [DoubleRatchet DECRYPT] dh_pub={dh_short}... n={hdr.get('n')} pn={hdr.get('pn')}")
+            res = None
             if dr_session:
-                return dr_session.decrypt(envelope)
+                res = dr_session.decrypt(envelope)
             elif candidate_privates and envelope.get("header", {}).get("dh_pub"):
                 # Inizializza automaticamente la sessione Bob se riceve il primo messaggio DR
                 dh_pub = envelope["header"]["dh_pub"]
@@ -304,8 +325,10 @@ def decifra_payload(ciphertext, candidate_privates: list, dr_session: DoubleRatc
                     info=b"ChatControl DoubleRatchet SharedSecret"
                 ).derive(my_priv.exchange(remote_pub))
                 session = DoubleRatchetSession.init_bob(shared_secret, my_priv_b64)
-                return session.decrypt(envelope)
-            return None
+                res = session.decrypt(envelope)
+            if enable_dpi_obfuscation and res:
+                res = unpad_payload_from_bucket(res)
+            return res
 
         if envelope.get("v") != 3:
             return None
@@ -323,9 +346,13 @@ def decifra_payload(ciphertext, candidate_privates: list, dr_session: DoubleRatc
 
         payload_box = nacl.secret.SecretBox(mmk)
         encrypted_data = base64.b64decode(envelope.get("data", ""))
-        return payload_box.decrypt(encrypted_data)
+        raw_decrypted = payload_box.decrypt(encrypted_data)
+        if enable_dpi_obfuscation and raw_decrypted:
+            raw_decrypted = unpad_payload_from_bucket(raw_decrypted)
+        return raw_decrypted
     except Exception:
         return None
+
 
 
 def genera_chiavi() -> tuple[str | None, str | None]:
