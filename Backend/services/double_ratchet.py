@@ -76,6 +76,10 @@ class DoubleRatchetSession:
         session.nr = 0
         session.pn = 0
         session.mk_skipped = {}
+
+        my_dh_pub_b64 = base64.b64encode(dhs_priv.public_key().public_bytes_raw()).decode('utf-8')
+        print(f"⚙️ [DR INIT ALICE] SharedSecret={shared_secret.hex()[:10]}... | Bob_pub={bob_dh_pub_b64[:10]}... | My_DH_pub={my_dh_pub_b64[:10]}...")
+        print(f"   └── RK={rk.hex()[:10]}... | CKs={cks.hex()[:10]}... | CKr=None")
         return session
 
     @classmethod
@@ -91,6 +95,10 @@ class DoubleRatchetSession:
         session.nr = 0
         session.pn = 0
         session.mk_skipped = {}
+
+        my_dh_pub_b64 = base64.b64encode(session.dhs_priv.public_key().public_bytes_raw()).decode('utf-8')
+        print(f"⚙️ [DR INIT BOB] SharedSecret={shared_secret.hex()[:10]}... | My_DH_pub={my_dh_pub_b64[:10]}...")
+        print(f"   └── RK={shared_secret.hex()[:10]}... | CKs=None | CKr=None (Waiting for first message)")
         return session
 
     def encrypt(self, plaintext: bytes | str) -> dict:
@@ -99,6 +107,7 @@ class DoubleRatchetSession:
             plaintext = plaintext.encode("utf-8")
 
         if not self.cks:
+            print(f"⚠️ [DR ENCRYPT ERROR] Stato Ratchet non pronto per l'invio (manca CKs). ns={self.ns} nr={self.nr}")
             raise ValueError("Stato Ratchet non pronto per l'invio (manca CKs)")
 
         self.cks, mk = kdf_ck(self.cks)
@@ -107,11 +116,13 @@ class DoubleRatchetSession:
         enc_payload = box.encrypt(plaintext, nonce)
 
         pub_bytes = self.dhs_priv.public_key().public_bytes_raw()
+        my_dh_pub = base64.b64encode(pub_bytes).decode("utf-8")
         header = {
-            "dh_pub": base64.b64encode(pub_bytes).decode("utf-8"),
+            "dh_pub": my_dh_pub,
             "pn": self.pn,
             "n": self.ns,
         }
+        print(f"🔒 [DR ENCRYPT] n={self.ns} pn={self.pn} dh_pub={my_dh_pub[:12]}... | Next CKs={self.cks.hex()[:10]}... PayloadLen={len(plaintext)}")
         self.ns += 1
 
         return {
@@ -123,6 +134,7 @@ class DoubleRatchetSession:
     def decrypt(self, envelope: dict) -> bytes:
         """Decifra un payload ed avanza il DH ed il Symmetric Ratchet di ricezione."""
         if envelope.get("v") != "dr_v1":
+            print(f"❌ [DR DECRYPT ERROR] Versione non valida: {envelope.get('v')}")
             raise ValueError(f"Versione Double Ratchet non valida: {envelope.get('v')}")
 
         header = envelope["header"]
@@ -131,11 +143,14 @@ class DoubleRatchetSession:
         pn = header["pn"]
         n = header["n"]
 
+        print(f"🔓 [DR DECRYPT ATTEMPT] Msg n={n} pn={pn} remote_dh_pub={dh_pub_b64[:12]}... | My State: ns={self.ns} nr={self.nr} pn={self.pn}")
+
         cipher_bytes = base64.b64decode(ciphertext_b64)
 
         # 1. Verifica se la chiave messaggio è tra quelle saltate (Skipped Keys)
         skipped_key = (dh_pub_b64, n)
         if skipped_key in self.mk_skipped:
+            print(f"⏭️ [DR DECRYPT SKIPPED KEY] Found key in mk_skipped for n={n}")
             mk_b64 = self.mk_skipped.pop(skipped_key)
             mk = base64.b64decode(mk_b64)
             box = nacl.secret.SecretBox(mk)
@@ -145,6 +160,7 @@ class DoubleRatchetSession:
 
         # 2. Se riceviamo una nuova chiave DH dal mittente, eseguiamo il DH Ratchet
         if self.dhr_pub is None or remote_pub.public_bytes_raw() != self.dhr_pub.public_bytes_raw():
+            print(f"🔄 [DR DH RATCHET TRIGGERED] Remote DH pub changed from {base64.b64encode(self.dhr_pub.public_bytes_raw()).decode('utf-8')[:12] if self.dhr_pub else 'None'} -> {dh_pub_b64[:12]}...")
             self._skip_message_keys(pn)
             self._dh_ratchet(remote_pub)
 
@@ -152,18 +168,28 @@ class DoubleRatchetSession:
 
         # 3. Avanza il Symmetric Ratchet di ricezione
         if not self.ckr:
+            print(f"❌ [DR DECRYPT ERROR] Stato CKr non disponibile per la decifratura (n={n}, nr={self.nr})")
             raise ValueError("Stato CKr non disponibile per la decifratura")
 
         self.ckr, mk = kdf_ck(self.ckr)
         self.nr += 1
 
         box = nacl.secret.SecretBox(mk)
-        return box.decrypt(cipher_bytes)
+        try:
+            decrypted = box.decrypt(cipher_bytes)
+            print(f"✅ [DR DECRYPT SUCCESS] Decrypted n={n} (nr is now {self.nr}) | PlaintextLen={len(decrypted)}")
+            return decrypted
+        except Exception as e:
+            print(f"❌ [DR DECRYPT FAIL] SecretBox decryption failed for n={n}: {e}")
+            raise e
 
     def _skip_message_keys(self, until: int):
         if self.ckr is not None:
             if self.nr + MAX_SKIP < until:
+                print(f"❌ [DR SKIP KEYS FAIL] Troppi messaggi saltati: current nr={self.nr}, until={until}")
                 raise ValueError("Troppi messaggi saltati nel Ratchet")
+            if self.nr < until:
+                print(f"⏭️ [DR SKIP KEYS] Advancing CKr from nr={self.nr} -> {until}")
             while self.nr < until:
                 self.ckr, mk = kdf_ck(self.ckr)
                 if self.dhr_pub:
@@ -180,11 +206,14 @@ class DoubleRatchetSession:
         # ECDH step 1: aggiorna CKr con le chiavi attuali
         dh_out1 = self.dhs_priv.exchange(self.dhr_pub)
         self.rk, self.ckr = kdf_rk(self.rk, dh_out1)
+        print(f"   ├── DH Step 1: dh_out1={dh_out1.hex()[:10]}... -> New RK={self.rk.hex()[:10]}... | New CKr={self.ckr.hex()[:10]}...")
 
         # ECDH step 2: rigenera la propria chiave DHs ed aggiorna CKs
         self.dhs_priv = X25519PrivateKey.from_private_bytes(os.urandom(32))
         dh_out2 = self.dhs_priv.exchange(self.dhr_pub)
         self.rk, self.cks = kdf_rk(self.rk, dh_out2)
+        my_new_dh_pub = base64.b64encode(self.dhs_priv.public_key().public_bytes_raw()).decode('utf-8')
+        print(f"   └── DH Step 2: dh_out2={dh_out2.hex()[:10]}... -> Final RK={self.rk.hex()[:10]}... | New CKs={self.cks.hex()[:10]}... | New My_DH_pub={my_new_dh_pub[:10]}...")
 
     def to_dict(self) -> dict:
         """Serializza lo stato della sessione per la persistenza nel vault SQLite."""

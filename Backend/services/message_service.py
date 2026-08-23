@@ -21,7 +21,8 @@ from services.crypto_service import (
     cifra_payload_stream, cifra_payload_dr,
     get_or_create_dr_session, save_dr_session_to_vault
 )
-from services.dpi_service import create_decoy_payload
+from services.dpi_service import create_decoy_payload, apply_covert_mimicry, pad_outer_payload, pad_payload_to_bucket
+from services.double_ratchet import DoubleRatchetSession
 from services.telegram_service import split_message
 from services.user_service import set_user_vault
 
@@ -52,8 +53,11 @@ def _build_encrypted_payload(metadata: dict, file_content: bytes, recipient_keys
         json_metadata = json.dumps(metadata, sort_keys=True)
         metadata_bytes = json_metadata.encode('utf-8')
         metadata_size = len(metadata_bytes)
-        yield metadata_size.to_bytes(4, byteorder='big') + metadata_bytes
-        yield file_content
+        raw_payload = metadata_size.to_bytes(4, byteorder='big') + metadata_bytes + file_content
+        if enable_dpi_obfuscation:
+            raw_payload = pad_payload_to_bucket(raw_payload, buckets=[4096, 16384, 65536, 262144])
+            print(f"🛡️ [Anti-DPI Document Padding] Payload interno padrato a: {len(raw_payload)} byte")
+        yield raw_payload
         
     out = bytearray()
     for chunk in cifra_payload_stream(_generator(), recipient_keys):
@@ -150,6 +154,8 @@ async def send_file_logic(chat_id: int, text: str, cryph: bool, group: bool, fil
                     yield chunk
 
             caption_dict = {"cif": "file"}
+            if enable_dpi_obfuscation:
+                caption_dict = apply_covert_mimicry(caption_dict)
             caption_str = json.dumps(caption_dict)
             if len(caption_str) > CAPTION_LIMIT:
                 raise HTTPException(status_code=413, detail=f"caption troppo lunga ({len(caption_str)}>{CAPTION_LIMIT})")
@@ -164,6 +170,10 @@ async def send_file_logic(chat_id: int, text: str, cryph: bool, group: bool, fil
                 elapsed = time.monotonic() - start_time
                 if elapsed >= 1.0 and (current / max(elapsed, 0.001)) < MIN_UPLOAD_BPS:
                     raise Exception("Connessione troppo lenta")
+
+            if enable_dpi_obfuscation and jitter_max_ms > 0:
+                delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
+                await asyncio.sleep(delay_sec)
 
             try:
                 from services.fast_telethon import upload_file
@@ -240,77 +250,90 @@ async def send_message_logic(chat_id: int, text: str, cryph: bool, group: bool, 
 
         json_da_cifrare = json.dumps(da_cifrare, sort_keys=True)
 
-        if not group:
-            dr_session, vault_deciphered = get_or_create_dr_session(data, chat_id, is_initiator=True)
+        is_too_long = len(text.encode("utf-8")) > 1200 or len(json_da_cifrare) > 1500
+
+        if not is_too_long:
+            dr_session = None
+            vault_deciphered = None
+            dr_session_advanced = None
             text_cyp = None
-            if dr_session and dr_session.cks:
-                text_cyp = cifra_payload_dr(json_da_cifrare, dr_session)
-                if text_cyp:
-                    encrypted_id = cifra_payload(id_message, recipient_keys)
-                    save_dr_session_to_vault(data, chat_id, dr_session, vault_deciphered)
+
+            if not group:
+                dr_session, vault_deciphered = get_or_create_dr_session(data, chat_id, is_initiator=True)
+                if dr_session and dr_session.cks:
+                    dr_session_clone = DoubleRatchetSession.from_dict(dr_session.to_dict())
+                    text_cyp = cifra_payload_dr(json_da_cifrare, dr_session_clone)
+                    if text_cyp:
+                        dr_session_advanced = dr_session_clone
 
             if not text_cyp:
                 text_cyp = cifra_payload(json_da_cifrare, recipient_keys)
-                encrypted_id = cifra_payload(id_message, recipient_keys)
-        else:
-            text_cyp = cifra_payload(json_da_cifrare, recipient_keys)
+
             encrypted_id = cifra_payload(id_message, recipient_keys)
-        
-        if text_cyp is None or encrypted_id is None:
-            raise HTTPException(status_code=500, detail="Errore durante la cifratura con age")
-        
-        if len(text_cyp) + len(encrypted_id) + 11 > MESSAGE_LIMIT:
-            nome_file = f"{secrets.token_hex(8)}.dat"
-            message_bytes = text.encode("utf-8")
-            
-            message_metadata = {
-                "cif": "message",
-                "timestamp": time.time(),
-                "id": id_message,
-            }
-            
-            encrypted_payload = _build_encrypted_payload(message_metadata, message_bytes, recipient_keys)
-            
-            file_in_ram = io.BytesIO(encrypted_payload)
-            file_in_ram.name = nome_file
-            caption = {"cif": "message"}
+            user_pub = chat_data.get('chiave', {}).get('pubblica') if 'chat_data' in locals() else None
+            self_keys = [user_pub] if user_pub else recipient_keys
+            self_cyp = cifra_payload(json_da_cifrare, self_keys)
 
-            try:
-                file_in_ram.seek(0)
-                await client.send_file(
-                    chat_id,
-                    file_in_ram,
-                    caption=json.dumps(caption),
-                    force_document=True,
-                    attributes=[DocumentAttributeFilename(nome_file)]
-                )
-                return {"status": "ok"}
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"Invio fallito: {e}")
-            
-        user_pub = chat_data.get('chiave', {}).get('pubblica') if 'chat_data' in locals() else None
-        self_keys = [user_pub] if user_pub else recipient_keys
-        self_cyp = cifra_payload(json_da_cifrare, self_keys)
-        recip_cyp = cifra_payload(json_da_cifrare, recipient_keys)
+            if text_cyp and encrypted_id and self_cyp:
+                finale = {
+                    "cif": "on",
+                    "text": text_cyp,
+                    "id": encrypted_id,
+                    "self_text": self_cyp,
+                }
+                if enable_dpi_obfuscation:
+                    finale = apply_covert_mimicry(finale)
+                    finale = pad_outer_payload(finale, max_bucket=4096)
 
-        finale = {
-            "cif": "on",
-            "text": text_cyp,
-            "id": encrypted_id,
-            "self_text": self_cyp,
-            "recip_text": recip_cyp,
+                raw_final_json = json.dumps(finale)
+                if enable_dpi_obfuscation:
+                    print(f"🛡️ [Anti-DPI Outer Padding] Payload JSON esterno allineato al bucket: {len(raw_final_json)} byte")
+
+                if len(raw_final_json) <= MESSAGE_LIMIT:
+                    if enable_dpi_obfuscation and jitter_max_ms > 0:
+                        delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
+                        await asyncio.sleep(delay_sec)
+
+                    try:
+                        await client.send_message(chat_id, raw_final_json)
+                        if dr_session_advanced and chat_id and not group:
+                            save_dr_session_to_vault(data, chat_id, dr_session_advanced, vault_deciphered)
+                        return {"status": "ok"}
+                    except Exception as e:
+                        print(f"⚠️ Telegram send_message failed: {e}")
+                        is_too_long = True
+                else:
+                    is_too_long = True
+
+        nome_file = f"{secrets.token_hex(8)}.dat"
+        message_bytes = text.encode("utf-8")
+        
+        message_metadata = {
+            "cif": "message",
+            "timestamp": time.time(),
+            "id": id_message,
         }
         
-        if enable_dpi_obfuscation and jitter_max_ms > 0:
-            delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
-            await asyncio.sleep(delay_sec)
+        encrypted_payload = _build_encrypted_payload(message_metadata, message_bytes, recipient_keys)
+        
+        file_in_ram = io.BytesIO(encrypted_payload)
+        file_in_ram.name = nome_file
+        caption = {"cif": "message"}
+        if enable_dpi_obfuscation:
+            caption = apply_covert_mimicry(caption)
 
         try:
-            await client.send_message(chat_id, json.dumps(finale))
+            file_in_ram.seek(0)
+            await client.send_file(
+                chat_id,
+                file_in_ram,
+                caption=json.dumps(caption),
+                force_document=True,
+                attributes=[DocumentAttributeFilename(nome_file)]
+            )
+            return {"status": "ok"}
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"Invio fallito: {e}")
-
-    return {"status": "ok"}
 
 
 async def send_decoy_message_logic(chat_id: int, login_session: str, group: bool = False):
@@ -345,6 +368,9 @@ async def send_decoy_message_logic(chat_id: int, login_session: str, group: bool
         "self_text": self_cyp,
         "recip_text": recip_cyp,
     }
+    if enable_dpi_obfuscation:
+        finale = apply_covert_mimicry(finale)
+        finale = pad_outer_payload(finale)
 
     if enable_dpi_obfuscation and jitter_max_ms > 0:
         delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
@@ -407,10 +433,33 @@ async def send_public_key_logic(chat_id: int, login_session: str):
     vault_cifrato = cifra_vault(data_to_save, data['data']['masterkey'])
     set_user_vault(username, vault_cifrato)
 
+    # Reset dr_session nel vault del contatto per forzare l'avvio di una nuova sessione DR su nuova chiave
+    try:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT vault FROM contatti WHERE proprietario = ? AND contatto_id = ?", (username, chat_id_hash))
+            res = cursor.fetchone()
+            if res and res[0]:
+                v_dec = decifra_vault(res[0], data['data']['masterkey'])
+                if 'dr_session' in v_dec:
+                    v_dec.pop('dr_session', None)
+                    v_enc = cifra_vault(v_dec, data['data']['masterkey'])
+                    cursor.execute("UPDATE contatti SET vault = ? WHERE proprietario = ? AND contatto_id = ?", (v_enc, username, chat_id_hash))
+                    conn.commit()
+    except Exception:
+        pass
+
     message_payload = {
         "cif": "in",
         "public": pubblica
     }
+    if enable_dpi_obfuscation:
+        message_payload = apply_covert_mimicry(message_payload)
+        message_payload = pad_outer_payload(message_payload)
+
+    if enable_dpi_obfuscation and jitter_max_ms > 0:
+        delay_sec = random.uniform(jitter_min_ms, jitter_max_ms) / 1000.0
+        await asyncio.sleep(delay_sec)
     
     try:
         await client.send_message(chat_id, json.dumps(message_payload))

@@ -3,7 +3,8 @@ import base64
 import traceback
 import hashlib
 import io
-from core.config import pepper
+from core.config import pepper, enable_dpi_obfuscation
+from services.dpi_service import unpad_payload_from_bucket, PAD_MAGIC, revert_covert_mimicry
 from services.auth_service import get_user_data_by_temp_id
 from services.telegram_service import is_group_chat_id
 from services.crypto_service import (
@@ -49,9 +50,12 @@ async def _process_text_message(event, message_data, parsed, chat_keys, data):
     id_message_encrypted = message_data['json'].get('id')
     timestamp = message_data.get('date')
 
-    # Usa la chiave privata corrente (nessuna retroattività)
+    from services.crypto_service import get_all_user_private_keys
     priv = chat_keys.get('chiave', {}).get('privata')
     candidate_privates = [priv] if priv else []
+    for pk in get_all_user_private_keys(data):
+        if pk not in candidate_privates:
+            candidate_privates.append(pk)
 
     is_out = message_data.get('out') or getattr(event.message, 'out', False)
 
@@ -158,11 +162,22 @@ async def _process_document_payload(client, entity, event, message_data, parsed,
 
     buffer = bytearray()
     try:
-        metadata_size_bytes = await _read_exact(decrypted_stream, 4, buffer)
-        if metadata_size_bytes:
-            metadata_size = int.from_bytes(metadata_size_bytes, byteorder='big')
-            inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
-            
+        first4 = await _read_exact(decrypted_stream, 4, buffer)
+        if first4:
+            message_content_bytes = None
+            if first4 == PAD_MAGIC:
+                orig_len_bytes = await _read_exact(decrypted_stream, 4, buffer)
+                orig_len = int.from_bytes(orig_len_bytes, byteorder='big')
+                metadata_size_bytes = await _read_exact(decrypted_stream, 4, buffer)
+                metadata_size = int.from_bytes(metadata_size_bytes, byteorder='big')
+                inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
+                content_len = orig_len - 4 - metadata_size
+                if content_len >= 0:
+                    message_content_bytes = await _read_exact(decrypted_stream, content_len, buffer)
+            else:
+                metadata_size = int.from_bytes(first4, byteorder='big')
+                inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
+
             if inner_metadata_bytes:
                 try:
                     inner_metadata_str = inner_metadata_bytes.decode('utf-8')
@@ -183,11 +198,13 @@ async def _process_document_payload(client, entity, event, message_data, parsed,
                     if (diff_seconds is not None and diff_seconds > 10) or (id_message_decifrato in data['ids_']):
                         message_data['error'] = "questo messaggio e' frutto di un replay attack"
                     else:
-                        message_bytes = bytearray(buffer)
-                        async for chunk in decrypted_stream:
-                            message_bytes.extend(chunk)
-                            
-                        message_data['text'] = message_bytes.decode('utf-8', errors='replace')
+                        if message_content_bytes is None:
+                            content_buf = bytearray(buffer)
+                            async for chunk in decrypted_stream:
+                                content_buf.extend(chunk)
+                            message_content_bytes = bytes(content_buf)
+
+                        message_data['text'] = message_content_bytes.decode('utf-8', errors='replace')
                         data['ids_'].add(id_message_decifrato)
                         message_data['secure'] = True
                         message_data['file'] = False

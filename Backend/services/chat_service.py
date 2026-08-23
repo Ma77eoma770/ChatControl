@@ -10,7 +10,7 @@ import traceback
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
-from core.config import pepper
+from core.config import pepper, enable_dpi_obfuscation
 from services.crypto_service import (
     cifra_vault, is_valid_public_key, store_public_key_in_vault,
     decifra_payload, get_or_create_dr_session, save_dr_session_to_vault
@@ -19,6 +19,7 @@ from services.auth_service import is_logged_in
 from services.telegram_service import is_group_chat_id, set_media
 from services.realtime_service import index_messages
 from database.sqlite import get_connection
+from services.dpi_service import revert_covert_mimicry, PAD_MAGIC, unpad_payload_from_bucket
 from services.user_service import get_gruppo_vault, get_chat_vault
 from telethon.tl.types import (
     MessageService, MessageActionChatCreate, MessageActionChatDeleteUser, 
@@ -123,6 +124,7 @@ def _calculate_time_window(messages: list) -> tuple[datetime | None, datetime | 
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
+                parsed = revert_covert_mimicry(parsed)
                 message['json'] = parsed
                 message['is_json'] = True
             else:
@@ -162,6 +164,7 @@ def _populate_decrypted_ids(messages_in_window: list, data: dict, chat_keys: dic
             parsed = json.loads(text)
             if not isinstance(parsed, dict):
                 continue
+            parsed = revert_covert_mimicry(parsed)
             cif_flag = parsed.get('CIF') or parsed.get('cif')
             if cif_flag not in ("on", "file", "message"):
                 continue
@@ -210,8 +213,12 @@ def _handle_encrypted_text(message: dict, data: dict, chat_keys: dict, chat_id: 
     timestamp = message.get('date')
     id_enc = message['json'].get('id')
 
+    from services.crypto_service import get_all_user_private_keys
     priv = chat_keys.get('chiave', {}).get('privata')
     candidates = [priv] if priv else []
+    for pk in get_all_user_private_keys(data):
+        if pk not in candidates:
+            candidates.append(pk)
 
     is_outgoing = message.get('out', False)
 
@@ -367,11 +374,22 @@ async def _handle_encrypted_document_payload(message: dict, client, entity, data
         
     buffer = bytearray()
     try:
-        metadata_size_bytes = await _read_exact(decrypted_stream, 4, buffer)
-        if metadata_size_bytes:
-            metadata_size = int.from_bytes(metadata_size_bytes, byteorder='big')
-            inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
-            
+        first4 = await _read_exact(decrypted_stream, 4, buffer)
+        if first4:
+            message_content_bytes = None
+            if first4 == PAD_MAGIC:
+                orig_len_bytes = await _read_exact(decrypted_stream, 4, buffer)
+                orig_len = int.from_bytes(orig_len_bytes, byteorder='big')
+                metadata_size_bytes = await _read_exact(decrypted_stream, 4, buffer)
+                metadata_size = int.from_bytes(metadata_size_bytes, byteorder='big')
+                inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
+                content_len = orig_len - 4 - metadata_size
+                if content_len >= 0:
+                    message_content_bytes = await _read_exact(decrypted_stream, content_len, buffer)
+            else:
+                metadata_size = int.from_bytes(first4, byteorder='big')
+                inner_metadata_bytes = await _read_exact(decrypted_stream, metadata_size, buffer)
+
             if inner_metadata_bytes:
                 try:
                     inner_metadata = json.loads(inner_metadata_bytes.decode('utf-8'))
@@ -386,12 +404,13 @@ async def _handle_encrypted_document_payload(message: dict, client, entity, data
                     if (diff_sec is not None and diff_sec > 10) or (id_dec in data['ids_']):
                         message['error'] = "questo messaggio e' frutto di un replay attack"
                     else:
-                        # Raccogliamo il resto dello stream (che è il testo del messaggio)
-                        message_bytes = bytearray(buffer)
-                        async for chunk in decrypted_stream:
-                            message_bytes.extend(chunk)
-                            
-                        message['text'] = message_bytes.decode('utf-8', errors='replace')
+                        if message_content_bytes is None:
+                            content_buf = bytearray(buffer)
+                            async for chunk in decrypted_stream:
+                                content_buf.extend(chunk)
+                            message_content_bytes = bytes(content_buf)
+
+                        message['text'] = message_content_bytes.decode('utf-8', errors='replace')
                         data['ids_'].add(id_dec)
                         message.update({'secure': True, 'file': False})
                         for key in ['media_type', 'filename', 'mime', 'size']:
@@ -514,18 +533,20 @@ async def get_init_messages_logic(chat_id: int, login_session: str):
     my_id = me.id if me else None
 
     init_messages = []
-    async for msg in client.iter_messages(entity, search='"cif": "in"', limit=None):
+    async for msg in client.iter_messages(entity, limit=None):
         if my_id and msg.sender_id == my_id:
             continue
         text = msg.message or ''
         try:
             parsed = json.loads(text)
-            cif_flag = parsed.get('CIF') or parsed.get('cif')
-            pubblic = parsed.get('public')
-            if cif_flag == "in" and pubblic is not None and is_valid_public_key(pubblic):
-                init_messages.append({
-                    'id': msg.id, 'date': msg.date, 'public_key': pubblic, 'sender_id': msg.sender_id
-                })
+            if isinstance(parsed, dict):
+                parsed = revert_covert_mimicry(parsed)
+                cif_flag = parsed.get('CIF') or parsed.get('cif')
+                pubblic = parsed.get('public')
+                if cif_flag == "in" and pubblic is not None and is_valid_public_key(pubblic):
+                    init_messages.append({
+                        'id': msg.id, 'date': msg.date, 'public_key': pubblic, 'sender_id': msg.sender_id
+                    })
         except Exception:
             pass
 
@@ -673,6 +694,8 @@ async def download_encrypt_media_logic(chat_id: int, message_id: int, login_sess
             raise HTTPException(status_code=400, detail="Documento non cifrato")
 
         caption_json = json.loads(message.message or "{}")
+        if isinstance(caption_json, dict):
+            caption_json = revert_covert_mimicry(caption_json)
         if caption_json.get('CIF', caption_json.get('cif')) != "file":
             raise HTTPException(status_code=400, detail="Caption non cifrata")
 

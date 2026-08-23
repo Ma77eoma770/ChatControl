@@ -1,17 +1,16 @@
+import asyncio
+import random
 from fastapi import FastAPI
 from database import sqlite as db_setup
 from routes import router as api_router
 from fastapi.middleware.cors import CORSMiddleware
-
-
-
+from core.config import enable_decoy_traffic
 
 
 # Istanzia l'applicazione FastAPI principale per il backend di ChatControl
 app = FastAPI()
 
 # Configurazione del middleware CORS per abilitare le richieste cross-origin
-# Limita l'accesso solo agli URL del frontend di sviluppo (locale) e di produzione
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -22,17 +21,32 @@ app.add_middleware(
         "https://apernici.it",
     ],
     allow_credentials=True,
-    allow_methods=["*"],  # Permetti tutti i metodi HTTP (GET, POST, ecc.)
-    allow_headers=["*"],  # Permetti tutti gli header
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Registra il router principale (raccoglie tutti i sotto-router da routes/)
+# Registra il router principale
 app.include_router(api_router)
-# Initialize database on backend startup
+
+
+async def periodic_decoy_worker():
+    """Worker in background per l'offuscamento temporale tramite il traffico civetta."""
+    while True:
+        try:
+            await asyncio.sleep(random.uniform(60.0, 300.0))
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 @app.on_event("startup")
 async def startup_event():
-	"""Inizializza il DB all'avvio del backend."""
-	db_setup.initDB()  # This executes the setup code in sqlite.py
+    """Inizializza il DB e i servizi di background all'avvio del backend."""
+    db_setup.initDB()
+    if enable_decoy_traffic:
+        asyncio.create_task(periodic_decoy_worker())
+
 
 
 

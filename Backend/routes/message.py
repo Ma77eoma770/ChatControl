@@ -3,7 +3,8 @@ from pydantic import BaseModel
 
 from services.message_service import (
     delete_message_logic, send_file_logic, 
-    send_message_logic, send_public_key_logic
+    send_message_logic, send_public_key_logic,
+    send_decoy_message_logic
 )
 
 router = APIRouter()
@@ -20,6 +21,10 @@ class DeleteMessage(BaseModel):
 
 class InitKey(BaseModel):
     chat_id: int
+
+class DecoyPayload(BaseModel):
+    chat_id: int
+    group: bool = False
 
 @router.post("/messages/delete")
 async def delete_message(message: DeleteMessage, login_session: str = Cookie(None)):
@@ -56,3 +61,8 @@ async def send_public_key(credentials: InitKey, login_session: str = Cookie(None
     """Genera una coppia di chiavi per la chat, aggiorna il Vault e invia la chiave pubblica."""
     # Rotta solitamente invocata alla prima apertura di una chat crittografata
     return await send_public_key_logic(credentials.chat_id, login_session)
+
+@router.post("/messages/send/decoy")
+async def send_decoy(payload: DecoyPayload, login_session: str = Cookie(None)):
+    """Invia un messaggio civetta (decoy/dummy) cifrato per disturbare l'analisi del traffico DPI."""
+    return await send_decoy_message_logic(payload.chat_id, login_session, payload.group)

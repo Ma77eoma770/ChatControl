@@ -81,12 +81,15 @@ def cifra_payload_dr(plaintext: str | bytes, dr_session: DoubleRatchetSession) -
             plaintext = pad_payload_to_bucket(plaintext)
 
         dr_envelope = dr_session.encrypt(plaintext)
+        hdr = dr_envelope.get("header", {})
+        dh_short = str(hdr.get("dh_pub", ""))[:12]
+        n_val = hdr.get("n")
+        pn_val = hdr.get("pn")
+
         if enable_dpi_obfuscation:
             dr_envelope = apply_covert_mimicry(dr_envelope)
 
-        hdr = dr_envelope.get("header", {}) or dr_envelope.get("ref", {})
-        dh_short = str(hdr.get("dh_pub", ""))[:12]
-        print(f"🔒 [DoubleRatchet ENCRYPT] dh_pub={dh_short}... n={hdr.get('n')} pn={hdr.get('pn')}")
+        print(f"🔒 [DoubleRatchet ENCRYPT] dh_pub={dh_short}... n={n_val} pn={pn_val}")
         json_bytes = json.dumps(dr_envelope).encode('utf-8')
         return base64.b64encode(json_bytes).decode('utf-8')
     except Exception as e:
@@ -104,6 +107,54 @@ def derive_shared_secret(my_priv_b64: str, remote_pub_b64: str) -> bytes:
         salt=b"\x00" * 32,
         info=b"ChatControl DoubleRatchet SharedSecret"
     ).derive(my_priv.exchange(remote_pub))
+
+
+def get_all_user_private_keys(data: dict) -> list[str]:
+    """
+    Raccoglie tutte le chiavi private dell'utente da tutte le chat in data['data']['chats'].
+    """
+    priv_keys = []
+    if not data or 'data' not in data:
+        return priv_keys
+    chats = data['data'].get('chats', {})
+    for chat_info in chats.values():
+        if isinstance(chat_info, dict):
+            priv = chat_info.get('chiave', {}).get('privata')
+            if priv and priv not in priv_keys:
+                priv_keys.append(priv)
+            for k in chat_info.get('chiavi', []):
+                priv_k = k.get('privata')
+                if priv_k and priv_k not in priv_keys:
+                    priv_keys.append(priv_k)
+    return priv_keys
+
+
+def find_matching_private_key(data: dict, public_key_b64: str | None = None) -> str | None:
+    """
+    Trova nell'account dell'utente la chiave privata che corrisponde esattamente 
+    alla chiave pubblica fornita (o la prima chiave privata valida).
+    """
+    if not data or 'data' not in data:
+        return None
+
+    all_privs = get_all_user_private_keys(data)
+    if not all_privs:
+        return None
+
+    if public_key_b64:
+        try:
+            target_pub_bytes = base64.b64decode(public_key_b64)
+            for p_b64 in all_privs:
+                try:
+                    priv_obj = X25519PrivateKey.from_private_bytes(base64.b64decode(p_b64))
+                    if priv_obj.public_key().public_bytes_raw() == target_pub_bytes:
+                        return p_b64
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return all_privs[0] if all_privs else None
 
 
 def get_or_create_dr_session(
@@ -151,6 +202,7 @@ def get_or_create_dr_session(
     if 'dr_session' in vault_deciphered and vault_deciphered['dr_session']:
         try:
             session = DoubleRatchetSession.from_dict(vault_deciphered['dr_session'])
+            print(f"📦 [DR VAULT LOADED] Chat={chat_id1} | ns={session.ns} nr={session.nr} pn={session.pn} | cks={'SET' if session.cks else 'NONE'} ckr={'SET' if session.ckr else 'NONE'}")
             if is_initiator and session.cks is None and session.ns == 0 and session.nr == 0:
                 remote_pub_b64 = remote_pub_override
                 if not remote_pub_b64:
@@ -159,7 +211,8 @@ def get_or_create_dr_session(
                     if active_keys:
                         remote_pub_b64 = active_keys[0]
                 chat_data = data.get('data', {}).get('chats', {}).get(chat_id_hash, {})
-                my_priv_b64 = chat_data.get('chiave', {}).get('privata')
+                my_pub_b64 = chat_data.get('chiave', {}).get('pubblica')
+                my_priv_b64 = find_matching_private_key(data, my_pub_b64)
                 if my_priv_b64 and remote_pub_b64:
                     shared_secret = derive_shared_secret(my_priv_b64, remote_pub_b64)
                     session = DoubleRatchetSession.init_alice(shared_secret, remote_pub_b64)
@@ -171,9 +224,22 @@ def get_or_create_dr_session(
 
     # Recupera le chiavi per l'inizializzazione
     chat_data = data.get('data', {}).get('chats', {}).get(chat_id_hash, {})
+    my_pub_b64 = chat_data.get('chiave', {}).get('pubblica')
     my_priv_b64 = chat_data.get('chiave', {}).get('privata')
+    if not my_priv_b64 and my_pub_b64:
+        my_priv_b64 = find_matching_private_key(data, my_pub_b64)
+
     if not my_priv_b64:
-        return None, vault_deciphered
+        my_priv_b64 = find_matching_private_key(data)
+        if not my_priv_b64:
+            pub, priv = genera_chiavi()
+            if pub and priv:
+                if 'chats' not in data['data']:
+                    data['data']['chats'] = {}
+                data['data']['chats'][chat_id_hash] = {
+                    'chiave': {'pubblica': pub, 'privata': priv, 'inizio': time.time()}
+                }
+                my_priv_b64 = priv
 
     remote_pub_b64 = remote_pub_override
     if not remote_pub_b64:
@@ -183,9 +249,11 @@ def get_or_create_dr_session(
             remote_pub_b64 = active_keys[0]
 
     if not remote_pub_b64:
+        print(f"⚠️ [DR VAULT INIT FAIL] Chat={chat_id1} | Missing remote active public key for contact.")
         return None, vault_deciphered
 
     shared_secret = derive_shared_secret(my_priv_b64, remote_pub_b64)
+    print(f"✨ [DR VAULT CREATING NEW SESSION] Chat={chat_id1} | Initiator={is_initiator} | MyPriv={my_priv_b64[:10]}... | RemotePub={remote_pub_b64[:10]}... | Derived SharedSecret={shared_secret.hex()[:10]}...")
     if is_initiator:
         session = DoubleRatchetSession.init_alice(shared_secret, remote_pub_b64)
     else:
@@ -240,8 +308,10 @@ def save_dr_session_to_vault(
                 (username, chat_id_hash, vault_cifrato)
             )
             conn.commit()
-        return True
-    except sqlite3.Error:
+            print(f"💾 [DR VAULT SAVED] Chat={chat_id1} | ns={dr_session.ns} nr={dr_session.nr} pn={dr_session.pn} saved to SQLite DB.")
+            return True
+    except sqlite3.Error as e:
+        print(f"❌ [DR VAULT SAVE FAIL] Chat={chat_id1}: {e}")
         return False
 
 
@@ -462,6 +532,8 @@ def store_public_key_in_vault(
                 chiave_info['fine'] = new_key_timestamp - 1
         chiavi_list.append(new_key)
         vault_deciphered['chiavi'] = chiavi_list
+        # Resetta la sessione DoubleRatchet per forzare il re-keying sulla nuova chiave
+        vault_deciphered.pop('dr_session', None)
 
     vault_cifrato = cifra_vault(vault_deciphered, user_data['data']['masterkey'])
     try:
@@ -642,6 +714,9 @@ def cifra_payload_stream(input_generator, public_keys: list):
         "ephemeral_pub": ephemeral_pub_b64,
         "deks": encrypted_deks
     }
+    if enable_dpi_obfuscation:
+        envelope = apply_covert_mimicry(envelope)
+
     envelope_bytes = json.dumps(envelope).encode('utf-8')
     yield _STREAM_MAGIC + len(envelope_bytes).to_bytes(4, byteorder='big') + envelope_bytes
 
@@ -697,6 +772,8 @@ async def decifra_payload_stream(async_iterator, candidate_privates: list):
         raise ValueError("Stream interrotto durante la lettura dell'envelope")
 
     envelope = json.loads(envelope_bytes.decode('utf-8'))
+    if enable_dpi_obfuscation:
+        envelope = revert_covert_mimicry(envelope)
     if envelope.get("v") != 3:
         raise ValueError(f"Versione envelope non supportata: {envelope.get('v')}")
 
