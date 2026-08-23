@@ -115,9 +115,9 @@ async def _process_text_message(event, message_data, parsed, chat_keys, data):
                         data['ids_'].add(target_id)
             elif dizionario.get('cif') == "dummy":
                 message_data['is_dummy'] = True
-                message_data['text'] = None
+                message_data['text'] = "🛡️ Pacchetto Civetta (Anti-DPI Dummy Sentinel)"
+                message_data['warning'] = "questo messaggio e' un pacchetto civetta (Anti-DPI)"
                 message_data['secure'] = True
-                return message_data
             else:
                 message_data['error'] = "questo messaggio e' stato modificato"
 

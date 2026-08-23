@@ -269,6 +269,11 @@ def _handle_encrypted_text(message: dict, data: dict, chat_keys: dict, chat_id: 
                     message['secure'] = True
                     if target_id:
                         data['ids_'].add(target_id)
+            elif diz.get('cif') == "dummy":
+                message['is_dummy'] = True
+                message['text'] = "🛡️ Pacchetto Civetta (Anti-DPI Dummy Sentinel)"
+                message['warning'] = "questo messaggio e' un pacchetto civetta (Anti-DPI)"
+                message['secure'] = True
             else:
                 message['error'] = "questo messaggio e' stato modificato"
         except Exception:

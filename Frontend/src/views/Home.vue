@@ -36,6 +36,8 @@
                 longPressTimer: null,
                 longPressStart: null,
                 longPressDelay: 550,
+                autoDecoyEnabled: false,
+                autoDecoyInterval: null,
             }
         },
         methods: {
@@ -490,6 +492,40 @@
                   this.loading = false
               }
             },
+            async sendDecoyMessage(){
+              if (!this.selectedChat) return
+              try {
+                await api.post('/messages/send/decoy', {
+                  chat_id: this.selectedChat.id,
+                  group: !!this.selectedChat.is_group
+                }, { withCredentials: true })
+                await this.fetchLatestMessages(1)
+                this.scrollToBottom()
+              } catch (e) {
+                this.errormsg = e.response?.data?.detail || e.message
+              }
+            },
+            toggleAutoDecoy(){
+              if (this.autoDecoyEnabled) {
+                this.sendDecoyMessage()
+                this.autoDecoyInterval = setInterval(() => {
+                  if (this.selectedChat && this.autoDecoyEnabled) {
+                    this.sendDecoyMessage()
+                  } else {
+                    this.stopAutoDecoy()
+                  }
+                }, 10000)
+              } else {
+                this.stopAutoDecoy()
+              }
+            },
+            stopAutoDecoy(){
+              if (this.autoDecoyInterval) {
+                clearInterval(this.autoDecoyInterval)
+                this.autoDecoyInterval = null
+              }
+              this.autoDecoyEnabled = false
+            },
             async init_chat(chat){
               try {
                 await api.get(`/chats/${chat.id}/inits`, { withCredentials: true })
@@ -808,7 +844,14 @@
         <div v-if="selectedChat" class="d-flex flex-column h-100">
           <div class="p-3 border-bottom d-flex align-items-center justify-content-between bg-light">
             <strong>{{ selectedChat.name }}</strong>
-            <button @click="sendkey()" class="btn btn-primary btn-sm">Invia chiave</button>
+            <div class="d-flex gap-2 align-items-center">
+              <button @click="sendDecoyMessage()" class="btn btn-warning btn-sm fw-bold">🛡️ Invia Civetta</button>
+              <div class="form-check form-switch m-0 ms-1 d-flex align-items-center gap-1" title="Invia automaticamente una civetta Anti-DPI ogni 10 secondi">
+                <input class="form-check-input" type="checkbox" id="autoDecoyToggle" v-model="autoDecoyEnabled" @change="toggleAutoDecoy">
+                <label class="form-check-label small fw-bold text-dark mb-0" for="autoDecoyToggle">Civetta (10s)</label>
+              </div>
+              <button @click="sendkey()" class="btn btn-primary btn-sm">Invia chiave</button>
+            </div>
           </div>
           
           <div class="messages-area flex-grow-1">
@@ -828,6 +871,7 @@
                  class="message-bubble"
                  :class="{
                    'message-error': m.error,
+                   'message-warning': m.warning || m.is_dummy,
                    'message-system-bubble': !!m.chiave,
                    'message-system-type-bubble': !!m.system_type
                  }"
@@ -900,7 +944,15 @@
                      <div class="file-size" v-if="m.size">{{ formatFileSize(m.size) }}</div>
                    </div>
                  </div>
-                 <div class="message-text" v-if="!m.error">
+                 <div class="message-text" v-if="m.warning || m.is_dummy">
+                    {{ m.text || m.warning }}
+                    <img 
+                      src="/alert-triangle.svg"  
+                      alt="Civetta"
+                      class="send-icon"
+                    >
+                  </div>
+                  <div class="message-text" v-else-if="!m.error">
                     <template v-if="m.chiave">
                       <div class="message-system-content">
                         <img src="/key.svg" alt="Chiave" class="message-key-icon">
@@ -1212,6 +1264,22 @@
 .message-error .message-time {
   color: #7f1d1d;
   opacity: 0.6;
+}
+
+.message-bubble.message-warning {
+  background-color: #fef3c7;
+  border: 1px solid #fde68a;
+  color: #92400e;
+}
+
+.message-warning .message-text {
+  color: #92400e;
+  font-weight: 500;
+}
+
+.message-warning .message-time {
+  color: #92400e;
+  opacity: 0.7;
 }
 
 .message-time {

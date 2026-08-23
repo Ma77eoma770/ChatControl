@@ -140,9 +140,6 @@ def register_telethon_handlers(client, temp_id: str, login_session: str):
                 elif cif_flag == "file":
                     message_data = await _process_encrypted_file(client, entity, event, message_data, parsed, chat_keys, data)
 
-            if message_data.get('is_dummy'):
-                # Pacchetto civetta/dummy Anti-DPI: scartato in silenzio, nessun broadcast WS o notifica
-                return
 
         payload = {
             "event_type": "new",
